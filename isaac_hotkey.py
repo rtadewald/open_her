@@ -8,13 +8,14 @@ import flet as ft
 
 import google.generativeai as genai
 
+from langchain_core.prompts import PromptTemplate, ChatPromptTemplate
+from langchain.tools import BaseTool, StructuredTool, tool
+from langchain.agents import create_react_agent, AgentExecutor
 from langchain_groq import ChatGroq
+from langchain import hub
 from langchain.memory import ConversationBufferMemory
 from langchain.chains import LLMChain
 from langchain_openai import ChatOpenAI
-from langchain_core.prompts import PromptTemplate
-from langchain.schema.runnable import RunnablePassthrough, RunnableLambda
-
 from openai import OpenAI
 
 from PIL import Image
@@ -25,13 +26,12 @@ from dotenv import load_dotenv, find_dotenv
 _ = load_dotenv(override=True)
 
 client = OpenAI()
-
 whisper_model = WhisperModel("small", 
                              compute_type="int8", 
                              cpu_threads=os.cpu_count(), 
                              num_workers=os.cpu_count())
 
-llm_chain = None
+agent_executor = None
 
 # Configurações de gravação
 stop_streaming = False
@@ -81,7 +81,7 @@ def write_chat(page, prompt, llm_response):
 
 def on_press(key, page):
     global recording_thread, recording, stop_streaming
-    if key == keyboard.Key.alt_l:
+    if key == keyboard.Key.alt_r:
         if not recording:
             recording = True
             recording_thread = threading.Thread(target=record_audio, args=('prompt.wav',))
@@ -90,7 +90,11 @@ def on_press(key, page):
             recording = False
             recording_thread.join()
             callback('prompt.wav', page)
-            
+    
+    if key == keyboard.Key.alt_l:
+        user_input = input("You:")
+        callback(user_input, page, transcribe=False)
+
     elif key == keyboard.Key.cmd:
         print("Stop Assistant")
         stop_streaming = True
@@ -124,35 +128,22 @@ def speak(text):
                 if max(chunk) > silence_threshold:
                     player_stream.write(chunk)
                     stream_start = True
-
+ 
 
 # Tools
-def take_screenshot():
-    screenshot = pyautogui.screenshot()
-    screenshot.save("screenshot.png")
+@tool
+def vision_prompt(prompt: str = None):
+    """
+    Take a screenshot and uses the 'prompt' variable to
+    ask for an artificial intelligence (AI) to describe precisely
+    what's in the image.
 
-
-# LLMs 
-def groq_prompt(prompt, img_context):
-    global llm_chain
-    if llm_chain is None:
-        template = open('templates/groq.md', 'r').read()
-
-        base_prompt = PromptTemplate(
-            input_variables=["chat_history", "input", "img_context"], template=template
-        )
-        # llm = ChatGroq(temperature=0, model_name="llama3-70b-8192")
-        llm = ChatGroq(temperature=0, model_name="llama3-8b-8192")
-        memory = ConversationBufferMemory(memory_key="chat_history",
-                                        input_key='input')
-        llm_chain = LLMChain(llm=llm, prompt=base_prompt, memory=memory)
-
+    prompt(str): The prompt to the AI to guide it on how should it describe in the image.
+    """
     
-    response = llm_chain.predict(input=prompt, 
-                                img_context=img_context)
-    return response
-
-def vision_prompt(prompt, img_path):
+    img_path = "screenshot.png"
+    screenshot = pyautogui.screenshot()
+    screenshot.save(img_path)
     img = Image.open(img_path)
 
     genai.configure(api_key=os.environ["GOOGLE_API_KEY"])
@@ -164,53 +155,64 @@ def vision_prompt(prompt, img_path):
     gemini = genai.GenerativeModel("gemini-1.5-flash-latest",
                                 generation_config=generation_config)
     
-
-    template = open('templates/vision.md', 'r').read()
-    response = gemini.generate_content([template, img])
+    if prompt is None:
+        prompt = open('templates/vision.md', 'r').read()
+    response = gemini.generate_content([prompt, img])
     return response.text
 
-def function_call(user_input):
-    template = open('templates/function_call.md', 'r').read()    
-    prompt = PromptTemplate(
-        input_variables=["input"], template=template
-    )
-    # llm = ChatGroq(temperature=0, model_name="llama3-8b-8192")
-    # llm = ChatGroq(temperature=0, model_name="llama3-70b-8192")
-    # llm = ChatGroq(temperature=0, model_name="mixtral-8x7b-32768")
-    # llm = ChatGroq(temperature=0, model_name="gemma-7b-it")
-    llm = ChatOpenAI(temperature=0, model="gpt-4")
 
-
-    chain = prompt | llm
-    response = chain.invoke(user_input)
-    return response.content
+# LLMs 
+def groq_prompt(user_input):
+    global agent_executor
+    if agent_executor is None:
+        template = open('templates/react.md', 'r').read()
+        prompt = PromptTemplate.from_template(template)
+        
+        llm = ChatGroq(temperature=0, model_name="llama3-70b-8192")
+        # llm = ChatOpenAI(temperature=0, model="gpt-4")
+        memory = ConversationBufferMemory(memory_key="chat_history",
+                                        input_key='input')
+        
+        tools = [vision_prompt]
+        agent = create_react_agent(llm, tools, prompt)
+        agent_executor = AgentExecutor(agent=agent, 
+                                       memory=memory,
+                                       tools=tools, 
+                                       verbose=True)
+    print(user_input)
+    response = agent_executor.invoke({"input": user_input})
+    print(response)
+    return response
 
 
 # MAIN CALLBACK
-def callback(audio_path, page):
-    segments, _ = whisper_model.transcribe(audio_path, language="pt")
-    clean_prompt = "".join(segment.text for segment in segments).strip()
-    
+def callback(audio_or_input, page, transcribe=True):
+    if transcribe:
+        segments, _ = whisper_model.transcribe(audio_or_input, language="pt")
+        clean_prompt = "".join(segment.text for segment in segments).strip()
+    else:
+        clean_prompt = audio_or_input
+
     if clean_prompt:
         print(clean_prompt)
-        func_call = function_call(clean_prompt)
-        img_context = ""
+        # func_call = function_call(clean_prompt)
+        # img_context = ""
 
-        if "answer" in func_call:
-            print("answer")
+        # if "answer" in func_call:
+        #     print("answer")
 
-        if "screenshot" in func_call:
-            print("screenshot")
-            take_screenshot()
+        # if "screenshot" in func_call:
+        #     print("screenshot")
+        #     # take_screenshot()
 
-            img_context = vision_prompt(clean_prompt, "screenshot.png")
-            print(img_context)
+        #     img_context = vision_prompt(clean_prompt, "screenshot.png")
+        #     print(img_context)
 
-        response = groq_prompt(clean_prompt, img_context)
-        print(response)
+        response = groq_prompt(clean_prompt)
+        # print(response)
 
-        write_chat(page, clean_prompt, response)
-        threading.Thread(target=speak, args=(response, )).start()
+        # write_chat(page, clean_prompt, response)
+        # threading.Thread(target=speak, args=(response, )).start()
         # speak(response)
 
 def main(page):
