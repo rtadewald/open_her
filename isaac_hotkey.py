@@ -161,6 +161,7 @@ def vision_prompt(prompt: str = None):
     return response.text
 
 
+
 # LLMs 
 def groq_prompt(user_input):
     global agent_executor
@@ -169,6 +170,7 @@ def groq_prompt(user_input):
         prompt = PromptTemplate.from_template(template)
         
         llm = ChatGroq(temperature=0, model_name="llama3-70b-8192")
+        # llm = ChatGroq(temperature=0, model_name="llama3-8b-8192")
         # llm = ChatOpenAI(temperature=0, model="gpt-4")
         memory = ConversationBufferMemory(memory_key="chat_history",
                                         input_key='input')
@@ -179,10 +181,10 @@ def groq_prompt(user_input):
                                        memory=memory,
                                        tools=tools, 
                                        verbose=True)
-    print(user_input)
+    # print(user_input)
     response = agent_executor.invoke({"input": user_input})
     print(response)
-    return response
+    return response["output"]
 
 
 # MAIN CALLBACK
@@ -195,24 +197,11 @@ def callback(audio_or_input, page, transcribe=True):
 
     if clean_prompt:
         print(clean_prompt)
-        # func_call = function_call(clean_prompt)
-        # img_context = ""
-
-        # if "answer" in func_call:
-        #     print("answer")
-
-        # if "screenshot" in func_call:
-        #     print("screenshot")
-        #     # take_screenshot()
-
-        #     img_context = vision_prompt(clean_prompt, "screenshot.png")
-        #     print(img_context)
-
         response = groq_prompt(clean_prompt)
-        # print(response)
+        print(response)
 
-        # write_chat(page, clean_prompt, response)
-        # threading.Thread(target=speak, args=(response, )).start()
+        write_chat(page, clean_prompt, response)
+        threading.Thread(target=speak, args=(response, )).start()
         # speak(response)
 
 def main(page):
