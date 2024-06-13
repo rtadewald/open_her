@@ -38,12 +38,12 @@ stop_streaming = False
 recording_thread = None
 recording = False
 FORMAT = pyaudio.paInt16
-CHANNELS = 2
+CHANNELS = 1
 RATE = 44100
 CHUNK = 1024
 
 # Funções
-def record_audio(filename='prompt.wav'):
+def record_audio(filename='prompt.wav', page=None):
     global recording
     recording = True
     audio = pyaudio.PyAudio()
@@ -51,6 +51,7 @@ def record_audio(filename='prompt.wav'):
     # Inicia o stream de gravação
     stream = audio.open(format=FORMAT, channels=CHANNELS,
                         rate=RATE, input=True,
+                        input_device_index=1,
                         frames_per_buffer=CHUNK)
     print("Recording...")
     frames = []
@@ -69,15 +70,10 @@ def record_audio(filename='prompt.wav'):
         wf.setsampwidth(audio.get_sample_size(FORMAT))
         wf.setframerate(RATE)
         wf.writeframes(b''.join(frames))
-    return filename
-
-def write_chat(page, prompt, llm_response):
-    user_message = ft.Markdown(f"**You**: {prompt}", extension_set="github-web", code_theme="github")
-    assistant_message = ft.Markdown(f"**Assistant**: {llm_response}", extension_set="github-web", code_theme="github")
     
-    page.controls[1].controls.append(user_message)
-    page.controls[1].controls.append(assistant_message)
-    page.update()
+    if page:
+        threading.Thread(target=callback, args=(filename, page)).start()
+        # callback(filename, page)
 
 def on_press(key, page):
     global recording_thread, recording, stop_streaming
@@ -130,6 +126,37 @@ def speak(text):
                     stream_start = True
  
 
+
+# UI Functions
+def toggle_recording(e, page):
+    global recording, recording_thread
+    if not recording:
+        recording = True
+        recording_thread = threading.Thread(target=record_audio, args=('prompt.wav', page))
+        recording_thread.start()
+        e.control.icon = ft.icons.STOP
+        e.control.tooltip = "Stop Recording"
+    else:
+        recording = False
+        if recording_thread:
+            recording_thread.join()
+        e.control.icon = ft.icons.MIC
+        e.control.tooltip = "Start Recording"
+    page.update()
+
+def write_chat(page, prompt, user=True):
+    sender = "You" if user else "Assistant"
+    message = ft.Markdown(f"**{sender}**: {prompt}", extension_set="github-web", code_theme="github")
+    page.controls[1].controls.append(message)
+    page.update()
+
+def on_text_input(e, page):
+    user_input = e.control.value
+    e.control.value = ""
+    page.update()
+    callback(user_input, page, transcribe=False)
+
+
 # Tools
 @tool
 def vision_prompt(prompt: str = None):
@@ -160,13 +187,28 @@ def vision_prompt(prompt: str = None):
     response = gemini.generate_content([prompt, img])
     return response.text
 
-
+@tool
+def general_search(query: str) -> str:
+    """Use this tool to search for general information."""
+    # llm = ChatOpenAI(temperature=0, model="gpt-4")
+    llm = ChatGroq(temperature=0, model_name="llama3-70b-8192")
+    
+    system = """You are a helpful assistant."""
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", system), 
+        ("human", "{input}")
+        ])
+    chain = prompt | llm
+    # search_prompt = f"Please provide detailed information on the following query: {query}"
+    search_prompt = query
+    return chain.invoke({"input": search_prompt}).content
 
 # LLMs 
 def groq_prompt(user_input):
     global agent_executor
     if agent_executor is None:
         template = open('templates/react.md', 'r').read()
+        # template = open('templates/react.md', 'r').read()
         prompt = PromptTemplate.from_template(template)
         
         llm = ChatGroq(temperature=0, model_name="llama3-70b-8192")
@@ -175,11 +217,12 @@ def groq_prompt(user_input):
         memory = ConversationBufferMemory(memory_key="chat_history",
                                         input_key='input')
         
-        tools = [vision_prompt]
+        tools = [vision_prompt, general_search]
         agent = create_react_agent(llm, tools, prompt)
         agent_executor = AgentExecutor(agent=agent, 
                                        memory=memory,
                                        tools=tools, 
+                                       handle_parsing_errors=True,
                                        verbose=True)
     # print(user_input)
     response = agent_executor.invoke({"input": user_input})
@@ -197,24 +240,56 @@ def callback(audio_or_input, page, transcribe=True):
 
     if clean_prompt:
         print(clean_prompt)
+        write_chat(page, clean_prompt)
+
         response = groq_prompt(clean_prompt)
         print(response)
-
-        write_chat(page, clean_prompt, response)
+        write_chat(page, response, user=False)
         threading.Thread(target=speak, args=(response, )).start()
-        # speak(response)
 
 def main(page):
+    def on_keyboard_event(e):
+        global stop_streaming
+        if e.meta and e.key == "S":
+            print("Stop Assistant")
+            record_button.icon = ft.icons.MIC
+            record_button.tooltip = "Start Recording"
+            stop_streaming = True
+        
+        elif e.meta and e.key == "R":
+            record_button.icon = ft.icons.STOP
+            record_button.tooltip = "Stop Recording"
+            toggle_recording(e, page)
+        page.update()
+
+    page.on_keyboard_event = on_keyboard_event
+
     page.title = "Voice Assistant"
     page.vertical_alignment = ft.MainAxisAlignment.START
 
     chat_list = ft.ListView(expand=True, spacing=10, padding=20, auto_scroll=True)
-    page.add(ft.Text("Voice Assistant is listening for the hotkey..."))
-    page.add(chat_list)
+    input_field = ft.TextField(label="You:", on_submit=lambda e: on_text_input(e, page))
+    record_button = ft.IconButton(
+        icon=ft.icons.MIC,
+        tooltip="Start Recording",
+        on_click=lambda e: toggle_recording(e, page),
+    )
 
-    listener_thread = threading.Thread(target=start_listening, args=(page,))
-    listener_thread.daemon = True
-    listener_thread.start()
+    page.add(
+        ft.Row(
+            controls=[
+                ft.Text("Voice Assistant is listening for the hotkey..."),
+                record_button
+            ],
+            alignment=ft.MainAxisAlignment.SPACE_BETWEEN  # Alinha os itens nas extremidades
+        )
+    )
+    page.add(chat_list)
+    page.add(input_field)
+
+    # Adicionar o KeyboardListener para capturar hotkeys
+    
+
 
 
 if __name__ == "__main__":
