@@ -26,6 +26,7 @@ _ = load_dotenv(override=True)
 
 client = OpenAI()
 
+
 whisper_model = WhisperModel("small", 
                              compute_type="int8", 
                              cpu_threads=os.cpu_count(), 
@@ -38,7 +39,7 @@ stop_streaming = False
 recording_thread = None
 recording = False
 FORMAT = pyaudio.paInt16
-CHANNELS = 2
+CHANNELS = 1
 RATE = 44100
 CHUNK = 1024
 
@@ -179,7 +180,6 @@ def function_call(user_input):
     # llm = ChatGroq(temperature=0, model_name="mixtral-8x7b-32768")
     # llm = ChatGroq(temperature=0, model_name="gemma-7b-it")
     llm = ChatOpenAI(temperature=0, model="gpt-4")
-
 
     chain = prompt | llm
     response = chain.invoke(user_input)
