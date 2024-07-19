@@ -32,7 +32,6 @@ r = sr.Recognizer()
 source = sr.Microphone()
 whisper_model = WhisperModel("small", compute_type="int8", cpu_threads=os.cpu_count(), num_workers=os.cpu_count())
 stop_streaming = False
-
 last_frames = deque(maxlen=5)
 
 
@@ -95,7 +94,6 @@ def vision_prompt(vision_list):
         vision_list.controls.append(video_description)
     vision_list.update()
     return last_view
-
 
 def write_chat(chat_list, message, user):
     user_message = ft.Markdown(f"**{user}**: {message}", 
@@ -186,7 +184,8 @@ def main(page):
     vision_list = ft.ListView(expand=True, spacing=10, padding=20)
     webcam_view = ft.Image(width=640, height=360)
 
-    chat_column = ft.Column([ft.Text("Voice Assistant is listening for the wake word..."), chat_list], expand=True)
+    chat_column = ft.Column([ft.Text("Voice Assistant is listening for the wake word..."), 
+                             chat_list], expand=True)
     webcam_column = ft.Column([webcam_view, vision_list], width=640)
     main_row = ft.Row([chat_column, webcam_column], expand=True)
     page.add(main_row)

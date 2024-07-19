@@ -23,6 +23,10 @@ from PIL import Image
 import pyautogui
 import markdown
 from dotenv import load_dotenv, find_dotenv
+import cv2
+import io
+import base64
+from collections import deque
 
 _ = load_dotenv(override=True)
 
@@ -41,15 +45,26 @@ CHANNELS = 1
 RATE = 44100
 CHUNK = 1024
 
+last_frames = deque(maxlen=5)
+
+
 # LLM Setup
 template = open('templates/vision_assistant.md', 'r').read()
 prompt = PromptTemplate(input_variables=["input", "video_description"], 
                         template=template)
-llm = ChatGroq(temperature=0, model_name="llama3-8b-8192")
+llm = ChatGroq(temperature=0, model_name="llama3-70b-8192")
 memory = ConversationBufferMemory(memory_key="chat_history",
                                 input_key='input')
 llm_chain = LLMChain(llm=llm, prompt=prompt, memory=memory)
 
+# LLM Prompter
+template2 = open('templates/vision_prompter.md', 'r').read()
+prompt2 = PromptTemplate(input_variables=["input"], 
+                        template=template2)
+llm2 = ChatGroq(temperature=0, model_name="llama3-8b-8192")
+memory2 = ConversationBufferMemory(memory_key="chat_history",
+                                input_key='input')
+llm_chain2 = LLMChain(llm=llm2, prompt=prompt2, memory=memory2)
 
 # Vision Model
 client_vlm = OpenAI(api_key='YOUR_API_KEY', base_url='http://192.168.1.4:23333/v1')
@@ -62,8 +77,26 @@ vision_chat = ChatOpenAI(
     )
 
 
-# Funções
-def record_audio(filename='prompt.wav', page=None):
+# Audio Functions
+def toggle_recording(e, page, chat_list):
+    global recording, recording_thread
+    if not recording:
+        recording = True
+        recording_thread = threading.Thread(target=record_audio, args=('prompt.wav', 
+                                                                       chat_list, 
+                                                                       page))
+        recording_thread.start()
+        e.control.icon = ft.icons.STOP
+        e.control.tooltip = "Stop Recording"
+    else:
+        recording = False
+        if recording_thread:
+            recording_thread.join()
+        e.control.icon = ft.icons.MIC
+        e.control.tooltip = "Start Recording"
+    page.update()
+
+def record_audio(filename, chat_list, page=None):
     global recording
     recording = True
     audio = pyaudio.PyAudio()
@@ -71,7 +104,7 @@ def record_audio(filename='prompt.wav', page=None):
     # Inicia o stream de gravação
     stream = audio.open(format=FORMAT, channels=CHANNELS,
                         rate=RATE, input=True,
-                        input_device_index=1,
+                        input_device_index=0,
                         frames_per_buffer=CHUNK)
     print("Recording...")
     frames = []
@@ -92,39 +125,10 @@ def record_audio(filename='prompt.wav', page=None):
         wf.writeframes(b''.join(frames))
     
     if page:
-        threading.Thread(target=callback, args=(filename, page)).start()
+        threading.Thread(target=callback, 
+                         args=(filename, 
+                               chat_list)).start()
         # callback(filename, page)
-
-def on_press(key, page):
-    global recording_thread, recording, stop_streaming
-    if key == keyboard.Key.alt_r:
-        if not recording:
-            recording = True
-            recording_thread = threading.Thread(target=record_audio, args=('prompt.wav',))
-            recording_thread.start()
-        else:
-            recording = False
-            recording_thread.join()
-            callback('prompt.wav', page)
-    
-    if key == keyboard.Key.alt_l:
-        user_input = input("You:")
-        callback(user_input, page, transcribe=False)
-
-    elif key == keyboard.Key.cmd:
-        print("Stop Assistant")
-        stop_streaming = True
-
-def start_listening(page):
-    print("Press Alt to start and stop recording")
-    print("Press Cmd to stop TTS")
-    
-    def on_press_wrapper(key):
-        on_press(key, page)
-
-    listener = keyboard.Listener(on_press=on_press_wrapper)
-    listener.start()
-    listener.join()
 
 def speak(text):
     global stop_streaming
@@ -145,62 +149,69 @@ def speak(text):
                     player_stream.write(chunk)
                     stream_start = True
  
-def vision_prompt(vision_list):
+
+
+# UI Functions
+def write_chat(chat_list, prompt, user=True):
+    sender = "You" if user else "Assistant"
+    message = ft.Markdown(f"**{sender}**: {prompt}", 
+                          extension_set="github-web", code_theme="github")
+    chat_list.controls.append(message)
+    chat_list.update()
+
+def on_text_input(e, page):
+    user_input = e.control.value
+    e.control.value = ""
+    page.update()
+    callback(user_input, transcribe=False)
+
+def webcam_stream(page, img):
+    global last_frames
+
+    fps = 30
+    cap = cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_FPS, fps)
+    i = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img_pil = Image.fromarray(frame)
+        buffer = io.BytesIO()
+        img_pil.save(buffer, format="JPEG")
+        img_str = base64.b64encode(buffer.getvalue()).decode()
+        img.src_base64 = img_str
+        
+        if i % fps == 0:
+            last_frames.append(img_str)
+        page.update()
+        i += 1
+
+
+
+# MAIN CALLBACK
+def vision_ai(question):
     global last_frames
 
     inputs = []
     last_view = ""
     for frame in last_frames:
         inputs+= [HumanMessage(content=[
-            {"type": "text", "text": "Describe the body of the guy"},
+            {"type": "text", "text": question},
             {"type": "image_url", 
             "image_url": {"url": f"data:image/jpeg;base64,{frame}"}},
             ])],
     responses = vision_chat.batch(inputs, max_tokens=512)
     for i, response in enumerate(responses):
         last_view += f"{i}: {response.content}"
-        video_description = ft.Markdown(f"{i}: {response.content}")
-        vision_list.controls.append(video_description)
-    vision_list.update()
+        # video_description = ft.Markdown(f"{i}: {response.content}")
+        # print(last_view)
     return last_view
 
 
-
-
-# UI Functions
-def toggle_recording(e, page):
-    global recording, recording_thread
-    if not recording:
-        recording = True
-        recording_thread = threading.Thread(target=record_audio, args=('prompt.wav', page))
-        recording_thread.start()
-        e.control.icon = ft.icons.STOP
-        e.control.tooltip = "Stop Recording"
-    else:
-        recording = False
-        if recording_thread:
-            recording_thread.join()
-        e.control.icon = ft.icons.MIC
-        e.control.tooltip = "Start Recording"
-    page.update()
-
-def write_chat(page, prompt, user=True):
-    sender = "You" if user else "Assistant"
-    message = ft.Markdown(f"**{sender}**: {prompt}", extension_set="github-web", code_theme="github")
-    page.controls[1].controls.append(message)
-    page.update()
-
-def on_text_input(e, page):
-    user_input = e.control.value
-    e.control.value = ""
-    page.update()
-    callback(user_input, page, transcribe=False)
-
-
-
-
-# MAIN CALLBACK
-def callback(audio_or_input, page, transcribe=True):
+def callback(audio_or_input, chat_list, transcribe=True):
     if transcribe:
         segments, _ = whisper_model.transcribe(audio_or_input, language="pt")
         clean_prompt = "".join(segment.text for segment in segments).strip()
@@ -209,26 +220,28 @@ def callback(audio_or_input, page, transcribe=True):
 
     if clean_prompt:
         print(clean_prompt)
-        write_chat(page, clean_prompt)
+        write_chat(chat_list, clean_prompt)
 
-        response = groq_prompt(clean_prompt)
-        print(response)
-        write_chat(page, response, user=False)
-
-
-        last_view = vision_prompt(vision_list)
+        vision_prompt = llm_chain2.invoke(clean_prompt)["text"]
+        print(vision_prompt)
+        last_view = vision_ai(vision_prompt)
         llm_response = llm_chain.invoke({"input": clean_prompt, 
                                          "video_description": last_view})
-        # print(llm_response)
-        # print(llm_response["text"])
-        write_chat(chat_list, llm_response["text"], "🤖 Assistant")
-        speak(llm_response["text"])
-
+        response = llm_response["text"]
+        print(response)
+        write_chat(chat_list, response, user=False)
         threading.Thread(target=speak, args=(response, )).start()
 
 def main(page):
+    page.title = "Voice Assistant"
+    page.vertical_alignment = ft.MainAxisAlignment.START
+
+    chat_list = ft.ListView(expand=True, spacing=10, padding=20, auto_scroll=True)
+    # vision_list = ft.ListView(expand=True, spacing=10, padding=20)
+    webcam_view = ft.Image()
+
     def on_keyboard_event(e):
-        global stop_streaming
+        global stop_streaming, recording
         if e.meta and e.key == "S":
             print("Stop Assistant")
             record_button.icon = ft.icons.MIC
@@ -236,40 +249,33 @@ def main(page):
             stop_streaming = True
         
         elif e.meta and e.key == "R":
-            record_button.icon = ft.icons.STOP
-            record_button.tooltip = "Stop Recording"
-            toggle_recording(e, page)
-        page.update()
+            record_button.icon = ft.icons.MIC if recording else ft.icons.STOP
+            record_button.tooltip = "Start Recording" if recording else "Stop Recording"
+            toggle_recording(e, page, chat_list)
+        # page.update()
 
     page.on_keyboard_event = on_keyboard_event
-
-    page.title = "Voice Assistant"
-    page.vertical_alignment = ft.MainAxisAlignment.START
-
-    chat_list = ft.ListView(expand=True, spacing=10, padding=20, auto_scroll=True)
-    input_field = ft.TextField(label="You:", on_submit=lambda e: on_text_input(e, page))
+    input_field = ft.TextField(label="You:",
+                               width=90, 
+                               expand=True, 
+                               on_submit=lambda e: on_text_input(e, page))
     record_button = ft.IconButton(
         icon=ft.icons.MIC,
         tooltip="Start Recording",
-        on_click=lambda e: toggle_recording(e, page),
+        on_click=lambda e: toggle_recording(e, page, chat_list),
     )
 
-    page.add(
-        ft.Row(
-            controls=[
-                ft.Text("Voice Assistant is listening for the hotkey..."),
-                record_button
-            ],
-            alignment=ft.MainAxisAlignment.SPACE_BETWEEN  # Alinha os itens nas extremidades
-        )
-    )
-    page.add(chat_list)
-    page.add(input_field)
-
-    # Adicionar o KeyboardListener para capturar hotkeys
+    chat_column = ft.Column([webcam_view, chat_list,
+        ft.Row(controls=[input_field, record_button,
+            ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+        ], expand=True)
+    page.add(chat_column)
     
-
-
+    # webcam_column = ft.Column([vision_list], width=640)
+    # main_row = ft.Row([chat_column, webcam_column], expand=True)
+    # page.add(main_row)
+   
+    threading.Thread(target=webcam_stream, args=(page, webcam_view)).start()
 
 if __name__ == "__main__":
     ft.app(target=main)
