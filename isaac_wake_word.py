@@ -26,17 +26,19 @@ from collections import deque
 
 _ = load_dotenv(find_dotenv())
 
-wake_word = "Ana"
+wake_word = "Eva"
 client = OpenAI()
 r = sr.Recognizer()
 source = sr.Microphone()
 whisper_model = WhisperModel("small", compute_type="int8", cpu_threads=os.cpu_count(), num_workers=os.cpu_count())
 stop_streaming = False
-last_frames = deque(maxlen=10)
+
+last_frames = deque(maxlen=5)
+
 
 # LLM Setup
 template = open('templates/vision_assistant.md', 'r').read()
-prompt = PromptTemplate(input_variables=["input"], 
+prompt = PromptTemplate(input_variables=["input", "video_description"], 
                         template=template)
 llm = ChatGroq(temperature=0, model_name="llama3-8b-8192")
 memory = ConversationBufferMemory(memory_key="chat_history",
@@ -56,44 +58,13 @@ vision_chat = ChatOpenAI(
 
 
 # Voice management
-def start_listening(chat_list):
+def start_listening(chat_list, vision_list):
     with source as s:
         r.adjust_for_ambient_noise(s, duration=2)
     print("Say", wake_word)
-    r.listen_in_background(source, lambda recognizer, audio: callback(recognizer, audio, chat_list))
-    # while True:
-        # time.sleep(0.5)
-
-def callback(recognizer, audio, chat_list):
-    prompt_audio_path = "prompt.wav"
-    with open(prompt_audio_path, "wb") as f:
-        f.write(audio.get_wav_data())
-
-    clean_prompt = wav_to_clean_text(prompt_audio_path, wake_word)
-    if clean_prompt:
-        # print(clean_prompt)
-        write_chat(chat_list, clean_prompt, "👦🏽 User")
-
-        vision_prompt()
-        llm_response = llm_chain.invoke(clean_prompt)
-        print(llm_response)
-        # print(llm_response["text"])
-        write_chat(chat_list, llm_response["text"], "🤖 Assistant")
-        speak(llm_response["text"])
-
-def vision_prompt():
-    global last_frames
-
-    inputs = [
-        [HumanMessage(content=[
-            {"type": "text", "text": "Transcribe briefly what you see."},
-            {"type": "image_url", 
-            "image_url": {"url": f"data:image/jpeg;base64,{last_frames[-1]}"}},
-            ])],
-    ]
-
-    response = vision_chat.invoke(inputs[0])
-    print(response.content)
+    r.listen_in_background(source, lambda recognizer, audio: callback(recognizer, audio, chat_list, vision_list))
+    while True:
+        time.sleep(0.5)
 
 def wav_to_clean_text(audio_path, wake_word):
     segments, _ = whisper_model.transcribe(audio_path, language="pt")
@@ -106,14 +77,32 @@ def wav_to_clean_text(audio_path, wake_word):
         return match.group(1).strip()
     return None
 
+def vision_prompt(vision_list):
+    global last_frames
+
+    inputs = []
+    last_view = ""
+    for frame in last_frames:
+        inputs+= [HumanMessage(content=[
+            {"type": "text", "text": "Describe the body of the guy"},
+            {"type": "image_url", 
+            "image_url": {"url": f"data:image/jpeg;base64,{frame}"}},
+            ])],
+    responses = vision_chat.batch(inputs, max_tokens=512)
+    for i, response in enumerate(responses):
+        last_view += f"{i}: {response.content}"
+        video_description = ft.Markdown(f"{i}: {response.content}")
+        vision_list.controls.append(video_description)
+    vision_list.update()
+    return last_view
+
+
 def write_chat(chat_list, message, user):
     user_message = ft.Markdown(f"**{user}**: {message}", 
                                extension_set="github-web", 
                                code_theme="github")
     chat_list.controls.append(user_message)
     chat_list.update()
-
-
 
 def speak(text):
     global stop_streaming
@@ -168,6 +157,25 @@ def webcam_stream(page, img):
         page.update()
         i += 1
 
+
+def callback(recognizer, audio, chat_list, vision_list):
+    prompt_audio_path = "prompt.wav"
+    with open(prompt_audio_path, "wb") as f:
+        f.write(audio.get_wav_data())
+
+    clean_prompt = wav_to_clean_text(prompt_audio_path, wake_word)
+    if clean_prompt:
+        # print(clean_prompt)
+        write_chat(chat_list, clean_prompt, "👦🏽 User")
+
+        last_view = vision_prompt(vision_list)
+        llm_response = llm_chain.invoke({"input": clean_prompt, 
+                                         "video_description": last_view})
+        # print(llm_response)
+        # print(llm_response["text"])
+        write_chat(chat_list, llm_response["text"], "🤖 Assistant")
+        speak(llm_response["text"])
+
 def main(page):
     page.window_width = 1280
     page.window_height = 720
@@ -175,16 +183,16 @@ def main(page):
     page.vertical_alignment = ft.MainAxisAlignment.START
 
     chat_list = ft.ListView(expand=True, spacing=10, padding=20, auto_scroll=True)
-    vision_list = ft.ListView(expand=True, spacing=10, padding=20, auto_scroll=True)
+    vision_list = ft.ListView(expand=True, spacing=10, padding=20)
     webcam_view = ft.Image(width=640, height=360)
 
     chat_column = ft.Column([ft.Text("Voice Assistant is listening for the wake word..."), chat_list], expand=True)
-    webcam_column = ft.Column([webcam_view], width=640)
+    webcam_column = ft.Column([webcam_view, vision_list], width=640)
     main_row = ft.Row([chat_column, webcam_column], expand=True)
     page.add(main_row)
 
     # Start the listening thread automatically
-    threading.Thread(target=start_listening, args=(chat_list,)).start()
+    threading.Thread(target=start_listening, args=(chat_list, vision_list)).start()
     listener = keyboard.Listener(on_press=stop_tts)
     listener.start()
     
