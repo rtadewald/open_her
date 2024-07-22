@@ -7,7 +7,7 @@ class RtSTT:
         self.recorder = AudioToTextRecorder(
                         spinner=False, 
                         model="small", 
-                        input_device_index=2, 
+                        input_device_index=0, 
                         compute_type='int8',
                         enable_realtime_transcription=True, 
                         silero_use_onnx=True, 

@@ -27,10 +27,15 @@ import cv2
 import io
 import base64
 from collections import deque
+import queue
+from time import time, sleep
 
 _ = load_dotenv(override=True)
 
 client = OpenAI()
+local_client = OpenAI(api_key="cant-be-empty", 
+                      base_url="http://192.168.1.4:8000/v1/")
+
 whisper_model = WhisperModel("small", 
                              compute_type="int8", 
                              cpu_threads=os.cpu_count(), 
@@ -44,51 +49,56 @@ FORMAT = pyaudio.paInt16
 CHANNELS = 1
 RATE = 44100
 CHUNK = 1024
+last_ts = time()
 
-last_frames = deque(maxlen=5)
-
+last_frames = queue.Queue(max_size=3)
+processed_frames = deque()
+process_counter=0
+global_ts = 0
 
 # LLM Setup
-template = open('templates/vision_assistant.md', 'r').read()
-prompt = PromptTemplate(input_variables=["input", "video_description"], 
-                        template=template)
-llm = ChatGroq(temperature=0, model_name="llama3-70b-8192")
-memory = ConversationBufferMemory(memory_key="chat_history",
-                                input_key='input')
-llm_chain = LLMChain(llm=llm, prompt=prompt, memory=memory)
+if True:
+    template = open('templates/vision_assistant.md', 'r').read()
+    prompt = PromptTemplate(input_variables=["input", "video_description"], 
+                            template=template)
+    llm = ChatGroq(temperature=0, model_name="llama3-8b-8192")
+    memory = ConversationBufferMemory(memory_key="chat_history",
+                                    input_key='input')
+    llm_chain = LLMChain(llm=llm, prompt=prompt, memory=memory)
 
-# LLM Prompter
-template2 = open('templates/vision_prompter.md', 'r').read()
-prompt2 = PromptTemplate(input_variables=["input"], 
-                        template=template2)
-llm2 = ChatGroq(temperature=0, model_name="llama3-8b-8192")
-memory2 = ConversationBufferMemory(memory_key="chat_history",
-                                input_key='input')
-llm_chain2 = LLMChain(llm=llm2, prompt=prompt2, memory=memory2)
+    # LLM Prompter
+    template2 = open('templates/vision_prompter.md', 'r').read()
+    prompt2 = PromptTemplate(input_variables=["input"], 
+                            template=template2)
+    llm2 = ChatGroq(temperature=0, model_name="llama3-8b-8192")
+    memory2 = ConversationBufferMemory(memory_key="chat_history",
+                                    input_key='input')
+    llm_chain2 = LLMChain(llm=llm2, prompt=prompt2, memory=memory2)
 
-# Vision Model
-client_vlm = OpenAI(api_key='YOUR_API_KEY', base_url='http://192.168.1.4:23333/v1')
-model_name = client_vlm.models.list().data[0].id
-vision_chat = ChatOpenAI(
-    temperature=0.0, 
-    model=model_name,
-    base_url="http://192.168.1.4:23333/v1", 
-    api_key="YOUR_API_KEY",
-    )
+    # Vision Model
+    client_vlm = OpenAI(api_key='YOUR_API_KEY', base_url='http://192.168.1.4:23333/v1')
+    model_name = client_vlm.models.list().data[0].id
+    vision_chat = ChatOpenAI(
+        temperature=0.0, 
+        model=model_name,
+        base_url="http://192.168.1.4:23333/v1", 
+        api_key="YOUR_API_KEY",
+        )
 
 
 # Audio Functions
 def toggle_recording(e, page, chat_list):
-    global recording, recording_thread
+    global recording, recording_thread, global_ts
     if not recording:
+        
         recording = True
         recording_thread = threading.Thread(target=record_audio, args=('prompt.wav', 
-                                                                       chat_list, 
-                                                                       page))
+                                                                       chat_list))
         recording_thread.start()
         e.control.icon = ft.icons.STOP
         e.control.tooltip = "Stop Recording"
     else:
+        global_ts = time()
         recording = False
         if recording_thread:
             recording_thread.join()
@@ -96,7 +106,7 @@ def toggle_recording(e, page, chat_list):
         e.control.tooltip = "Start Recording"
     page.update()
 
-def record_audio(filename, chat_list, page=None):
+def record_audio(filename, chat_list):
     global recording
     recording = True
     audio = pyaudio.PyAudio()
@@ -123,12 +133,10 @@ def record_audio(filename, chat_list, page=None):
         wf.setsampwidth(audio.get_sample_size(FORMAT))
         wf.setframerate(RATE)
         wf.writeframes(b''.join(frames))
-    
-    if page:
-        threading.Thread(target=callback, 
-                         args=(filename, 
-                               chat_list)).start()
-        # callback(filename, page)
+
+    threading.Thread(target=callback, 
+                        args=(filename, 
+                        chat_list)).start()
 
 def speak(text):
     global stop_streaming
@@ -150,7 +158,6 @@ def speak(text):
                     stream_start = True
  
 
-
 # UI Functions
 def write_chat(chat_list, prompt, user=True):
     sender = "You" if user else "Assistant"
@@ -166,7 +173,7 @@ def on_text_input(e, page):
     callback(user_input, transcribe=False)
 
 def webcam_stream(page, img):
-    global last_frames
+    global last_frames, recording
 
     fps = 30
     cap = cv2.VideoCapture(0)
@@ -184,37 +191,59 @@ def webcam_stream(page, img):
         img_str = base64.b64encode(buffer.getvalue()).decode()
         img.src_base64 = img_str
         
-        if i % fps == 0:
-            last_frames.append(img_str)
+        if i % fps == 0 and recording:
+            last_frames.put((time(), img_str))
         page.update()
         i += 1
 
 
-
 # MAIN CALLBACK
-def vision_ai(question):
-    global last_frames
+def vlm_call(question):
+    global last_frames, recording, process_counter
 
-    inputs = []
-    last_view = ""
-    for frame in last_frames:
-        inputs+= [HumanMessage(content=[
-            {"type": "text", "text": question},
-            {"type": "image_url", 
-            "image_url": {"url": f"data:image/jpeg;base64,{frame}"}},
-            ])],
-    responses = vision_chat.batch(inputs, max_tokens=512)
-    for i, response in enumerate(responses):
-        last_view += f"{i}: {response.content}"
+    def vision_ai(ts, question, frame):
+        global last_frames, process_counter
+        input = [HumanMessage(content=[
+                {"type": "text", "text": question},
+                {"type": "image_url", 
+                "image_url": {"url": f"data:image/jpeg;base64,{frame}"}},
+                ])]
+        response = vision_chat.invoke(input, max_tokens=512)
+        processed_frames.append((ts, response.content))
+        process_counter -= 1
+
+    while True:
+        if recording:
+            frame_pair = last_frames.get()
+            if frame_pair is None:
+                continue
+            ts, frame = frame_pair
+
+            process_counter += 1
+            print(f"Adding new thread {process_counter}")
+            t1 = threading.Thread(target=vision_ai, args=(ts, question, frame))
+            t1.start()
+        else:
+            sleep(0.5)
+    # for i, response in enumerate(responses):
+        # last_view += f"{i}: {response.content}"
         # video_description = ft.Markdown(f"{i}: {response.content}")
         # print(last_view)
     return last_view
 
-
 def callback(audio_or_input, chat_list, transcribe=True):
     if transcribe:
-        segments, _ = whisper_model.transcribe(audio_or_input, language="pt")
-        clean_prompt = "".join(segment.text for segment in segments).strip()
+        # Local Inferece
+        # segments, _ = whisper_model.transcribe(audio_or_input, language="pt")
+        # clean_prompt = "".join(segment.text for segment in segments).strip()
+
+        audio_file = open(audio_or_input, "rb")
+        clean_prompt = local_client.audio.transcriptions.create(
+            # model="Systran/faster-distil-whisper-large-v3", 
+            model="Systran/faster-whisper-small", 
+            file=audio_file
+        ).text
+        # print(transcript.text)
     else:
         clean_prompt = audio_or_input
 
@@ -222,15 +251,27 @@ def callback(audio_or_input, chat_list, transcribe=True):
         print(clean_prompt)
         write_chat(chat_list, clean_prompt)
 
-        vision_prompt = llm_chain2.invoke(clean_prompt)["text"]
-        print(vision_prompt)
-        last_view = vision_ai(vision_prompt)
+        # vision_prompt = llm_chain2.invoke(clean_prompt)["text"]
+        # print(vision_prompt)
+        while process_counter != 0:
+            print("Waiting processes to finish.")
+            sleep(0.5)
+        
+        last_view = ""
+        while len(processed_frames) > 0:
+            ts, answer = processed_frames.popleft()
+            last_view += f"{ts}: {answer}\n"
+        print(last_view)
         llm_response = llm_chain.invoke({"input": clean_prompt, 
                                          "video_description": last_view})
-        response = llm_response["text"]
+        
+        global global_ts
+        timediff = round((time() - global_ts) * 10) / 10
+        response = f"{timediff} : {llm_response['text']}"
         print(response)
         write_chat(chat_list, response, user=False)
         threading.Thread(target=speak, args=(response, )).start()
+
 
 def main(page):
     page.title = "Voice Assistant"
@@ -274,6 +315,10 @@ def main(page):
     # webcam_column = ft.Column([vision_list], width=640)
     # main_row = ft.Row([chat_column, webcam_column], expand=True)
     # page.add(main_row)
+    vision_prompt = "Describe what you see. If you see some text, transcribe it too."
+    t_vlm = threading.Thread(target=vlm_call, 
+                             args=(vision_prompt, ))
+    t_vlm.start()
    
     threading.Thread(target=webcam_stream, args=(page, webcam_view)).start()
 
