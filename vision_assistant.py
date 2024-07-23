@@ -30,18 +30,27 @@ from collections import deque
 import queue
 from time import time, sleep
 
-_ = load_dotenv(override=True)
 
-client = OpenAI()
-local_client = OpenAI(api_key="cant-be-empty", 
-                      base_url="http://192.168.1.4:8000/v1/")
+# App Control Variables
+image_analysis = True
+local_whisper_inferece=False
+audio_device = 0
+cam_device = 0
+llm_image_prompt = False
+# base_image_prompt = """
+# You are in a kitchen. Describe all the foods you see in the image.
+# """
+base_image_prompt = """
+Você está em uma cozinha. Descreva os alimentos que você vê. 
+Responda em portugues apenas.
+# """
 
-whisper_model = WhisperModel("small", 
-                             compute_type="int8", 
-                             cpu_threads=os.cpu_count(), 
-                             num_workers=os.cpu_count())
+base_image_prompt = """
+Describe what you see in this image.
+"""
 
-# Configurações de gravação
+# ===========================
+# Recording Setup
 stop_streaming = False
 recording_thread = None
 recording = False
@@ -49,15 +58,31 @@ FORMAT = pyaudio.paInt16
 CHANNELS = 1
 RATE = 44100
 CHUNK = 1024
-last_ts = time()
 
-last_frames = queue.Queue(max_size=3)
+# Threading Variables
+last_frames = deque(maxlen=1)
 processed_frames = deque()
+image_prompt = queue.Queue(maxsize=1)
+
+vlm_lock = threading.Lock()
+vlm_lock.acquire()
+
+last_ts = time()
 process_counter=0
 global_ts = 0
 
 # LLM Setup
 if True:
+    _ = load_dotenv(override=True)
+    client = OpenAI()
+    local_client = OpenAI(api_key="cant-be-empty", 
+                        base_url="http://192.168.1.4:8000/v1/")
+
+    whisper_model = WhisperModel("small", 
+                                compute_type="int8", 
+                                cpu_threads=os.cpu_count(), 
+                                num_workers=os.cpu_count())
+
     template = open('templates/vision_assistant.md', 'r').read()
     prompt = PromptTemplate(input_variables=["input", "video_description"], 
                             template=template)
@@ -90,7 +115,6 @@ if True:
 def toggle_recording(e, page, chat_list):
     global recording, recording_thread, global_ts
     if not recording:
-        
         recording = True
         recording_thread = threading.Thread(target=record_audio, args=('prompt.wav', 
                                                                        chat_list))
@@ -114,7 +138,7 @@ def record_audio(filename, chat_list):
     # Inicia o stream de gravação
     stream = audio.open(format=FORMAT, channels=CHANNELS,
                         rate=RATE, input=True,
-                        input_device_index=0,
+                        input_device_index=audio_device,
                         frames_per_buffer=CHUNK)
     print("Recording...")
     frames = []
@@ -176,7 +200,7 @@ def webcam_stream(page, img):
     global last_frames, recording
 
     fps = 30
-    cap = cv2.VideoCapture(0)
+    cap = cv2.VideoCapture(cam_device)
     cap.set(cv2.CAP_PROP_FPS, fps)
     i = 0
     while True:
@@ -191,15 +215,15 @@ def webcam_stream(page, img):
         img_str = base64.b64encode(buffer.getvalue()).decode()
         img.src_base64 = img_str
         
-        if i % fps == 0 and recording:
-            last_frames.put((time(), img_str))
+        if i % fps == 0:
+            last_frames.append((time(), img_str))
         page.update()
         i += 1
 
 
 # MAIN CALLBACK
-def vlm_call(question):
-    global last_frames, recording, process_counter
+def vlm_call():
+    global last_frames, recording, process_counter, base_image_prompt
 
     def vision_ai(ts, question, frame):
         global last_frames, process_counter
@@ -212,38 +236,48 @@ def vlm_call(question):
         processed_frames.append((ts, response.content))
         process_counter -= 1
 
+    skip = False
     while True:
         if recording:
-            frame_pair = last_frames.get()
-            if frame_pair is None:
+            # vlm_lock.acquire()
+            # vlm_lock.release()
+
+            if len(last_frames) > 0 and not skip:
+                ts, frame = last_frames.popleft()
+            else:
+                sleep(0.1)
                 continue
-            ts, frame = frame_pair
+            
+            if llm_image_prompt:
+                question = image_prompt.get()
+            else:
+                question = base_image_prompt
 
             process_counter += 1
             print(f"Adding new thread {process_counter}")
             t1 = threading.Thread(target=vision_ai, args=(ts, question, frame))
             t1.start()
+
+            if image_analysis:
+                skip = True
         else:
-            sleep(0.5)
-    # for i, response in enumerate(responses):
-        # last_view += f"{i}: {response.content}"
-        # video_description = ft.Markdown(f"{i}: {response.content}")
-        # print(last_view)
-    return last_view
+            skip = False
+            sleep(0.1)
+            
 
 def callback(audio_or_input, chat_list, transcribe=True):
     if transcribe:
-        # Local Inferece
-        # segments, _ = whisper_model.transcribe(audio_or_input, language="pt")
-        # clean_prompt = "".join(segment.text for segment in segments).strip()
-
-        audio_file = open(audio_or_input, "rb")
-        clean_prompt = local_client.audio.transcriptions.create(
-            # model="Systran/faster-distil-whisper-large-v3", 
-            model="Systran/faster-whisper-small", 
-            file=audio_file
-        ).text
-        # print(transcript.text)
+        if local_whisper_inferece:
+            segments, _ = whisper_model.transcribe(audio_or_input, language="pt")
+            clean_prompt = "".join(segment.text for segment in segments).strip()
+        else:
+            audio_file = open(audio_or_input, "rb")
+            clean_prompt = local_client.audio.transcriptions.create(
+                # model="Systran/faster-distil-whisper-large-v3", 
+                model="Systran/faster-whisper-small", 
+                file=audio_file
+            ).text
+            # print(transcript.text)
     else:
         clean_prompt = audio_or_input
 
@@ -251,23 +285,29 @@ def callback(audio_or_input, chat_list, transcribe=True):
         print(clean_prompt)
         write_chat(chat_list, clean_prompt)
 
-        # vision_prompt = llm_chain2.invoke(clean_prompt)["text"]
-        # print(vision_prompt)
+        if llm_image_prompt:
+            vision_prompt = llm_chain2.invoke(clean_prompt)["text"]
+            image_prompt.put(vision_prompt)
+            print(vision_prompt)
+        
+        # vlm_lock.release()
+        # vlm_lock.acquire()
+        
         while process_counter != 0:
-            print("Waiting processes to finish.")
-            sleep(0.5)
+            sleep(0.1)
         
         last_view = ""
         while len(processed_frames) > 0:
             ts, answer = processed_frames.popleft()
             last_view += f"{ts}: {answer}\n"
-        print(last_view)
+        print("Last view:", last_view)
         llm_response = llm_chain.invoke({"input": clean_prompt, 
                                          "video_description": last_view})
         
         global global_ts
         timediff = round((time() - global_ts) * 10) / 10
-        response = f"{timediff} : {llm_response['text']}"
+        # response = f"{timediff} : {llm_response['text']}"
+        response = llm_response['text']
         print(response)
         write_chat(chat_list, response, user=False)
         threading.Thread(target=speak, args=(response, )).start()
@@ -278,7 +318,6 @@ def main(page):
     page.vertical_alignment = ft.MainAxisAlignment.START
 
     chat_list = ft.ListView(expand=True, spacing=10, padding=20, auto_scroll=True)
-    # vision_list = ft.ListView(expand=True, spacing=10, padding=20)
     webcam_view = ft.Image()
 
     def on_keyboard_event(e):
@@ -293,9 +332,10 @@ def main(page):
             record_button.icon = ft.icons.MIC if recording else ft.icons.STOP
             record_button.tooltip = "Start Recording" if recording else "Stop Recording"
             toggle_recording(e, page, chat_list)
-        # page.update()
 
     page.on_keyboard_event = on_keyboard_event
+
+
     input_field = ft.TextField(label="You:",
                                width=90, 
                                expand=True, 
@@ -315,9 +355,7 @@ def main(page):
     # webcam_column = ft.Column([vision_list], width=640)
     # main_row = ft.Row([chat_column, webcam_column], expand=True)
     # page.add(main_row)
-    vision_prompt = "Describe what you see. If you see some text, transcribe it too."
-    t_vlm = threading.Thread(target=vlm_call, 
-                             args=(vision_prompt, ))
+    t_vlm = threading.Thread(target=vlm_call)
     t_vlm.start()
    
     threading.Thread(target=webcam_stream, args=(page, webcam_view)).start()
