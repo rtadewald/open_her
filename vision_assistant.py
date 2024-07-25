@@ -19,6 +19,8 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 from openai import OpenAI
 
+from wake_word_detector import *
+
 from PIL import Image
 import pyautogui
 import markdown
@@ -60,23 +62,23 @@ RATE = 44100
 CHUNK = 1024
 
 # Threading Variables
+wake_event = threading.Event()
+
 last_frames = deque(maxlen=1)
 processed_frames = deque()
 image_prompt = queue.Queue(maxsize=1)
 
-vlm_lock = threading.Lock()
-vlm_lock.acquire()
-
 last_ts = time()
 process_counter=0
 global_ts = 0
+
 
 # LLM Setup
 if True:
     _ = load_dotenv(override=True)
     client = OpenAI()
     local_client = OpenAI(api_key="cant-be-empty", 
-                        base_url="http://192.168.1.4:8000/v1/")
+                        base_url="http://192.168.1.5:8000/v1/")
 
     whisper_model = WhisperModel("small", 
                                 compute_type="int8", 
@@ -101,24 +103,28 @@ if True:
     llm_chain2 = LLMChain(llm=llm2, prompt=prompt2, memory=memory2)
 
     # Vision Model
-    client_vlm = OpenAI(api_key='YOUR_API_KEY', base_url='http://192.168.1.4:23333/v1')
+    client_vlm = OpenAI(api_key='YOUR_API_KEY', base_url='http://192.168.1.5:23333/v1')
     model_name = client_vlm.models.list().data[0].id
     vision_chat = ChatOpenAI(
         temperature=0.0, 
         model=model_name,
-        base_url="http://192.168.1.4:23333/v1", 
+        base_url="http://192.168.1.5:23333/v1", 
         api_key="YOUR_API_KEY",
         )
 
 
 # Audio Functions
 def toggle_recording(e, page, chat_list):
-    global recording, recording_thread, global_ts
+    global recording, recording_thread, global_ts, wake_event
+
     if not recording:
         recording = True
         recording_thread = threading.Thread(target=record_audio, args=('prompt.wav', 
                                                                        chat_list))
         recording_thread.start()
+        
+        wake_event.set()
+        wake_event.clear()
         e.control.icon = ft.icons.STOP
         e.control.tooltip = "Stop Recording"
     else:
@@ -223,7 +229,8 @@ def webcam_stream(page, img):
 
 # MAIN CALLBACK
 def vlm_call():
-    global last_frames, recording, process_counter, base_image_prompt
+    global last_frames, recording, process_counter, base_image_prompt 
+    global wake_event
 
     def vision_ai(ts, question, frame):
         global last_frames, process_counter
@@ -236,33 +243,27 @@ def vlm_call():
         processed_frames.append((ts, response.content))
         process_counter -= 1
 
-    skip = False
     while True:
-        if recording:
-            # vlm_lock.acquire()
-            # vlm_lock.release()
+        wake_event.wait()
+        process_counter += 1
 
-            if len(last_frames) > 0 and not skip:
-                ts, frame = last_frames.popleft()
-            else:
-                sleep(0.1)
-                continue
-            
-            if llm_image_prompt:
-                question = image_prompt.get()
-            else:
-                question = base_image_prompt
+        # if len(last_frames) > 0:
+        #     ts, frame = last_frames.popleft()
+        # else:
+        #     sleep(0.1)
 
-            process_counter += 1
-            print(f"Adding new thread {process_counter}")
-            t1 = threading.Thread(target=vision_ai, args=(ts, question, frame))
-            t1.start()
-
-            if image_analysis:
-                skip = True
+        #     continue
+        ts, frame = last_frames.popleft()
+        
+        if llm_image_prompt:
+            question = image_prompt.get()
         else:
-            skip = False
-            sleep(0.1)
+            question = base_image_prompt
+
+        print(f"Adding new thread {process_counter}")
+        t1 = threading.Thread(target=vision_ai, args=(ts, question, frame))
+        t1.start()
+
             
 
 def callback(audio_or_input, chat_list, transcribe=True):
@@ -290,9 +291,7 @@ def callback(audio_or_input, chat_list, transcribe=True):
             image_prompt.put(vision_prompt)
             print(vision_prompt)
         
-        # vlm_lock.release()
-        # vlm_lock.acquire()
-        
+        print(f"Process {process_counter}")
         while process_counter != 0:
             sleep(0.1)
         
@@ -308,34 +307,18 @@ def callback(audio_or_input, chat_list, transcribe=True):
         timediff = round((time() - global_ts) * 10) / 10
         # response = f"{timediff} : {llm_response['text']}"
         response = llm_response['text']
-        print(response)
+        print(f"LLM Response: {response}")
         write_chat(chat_list, response, user=False)
         threading.Thread(target=speak, args=(response, )).start()
 
 
 def main(page):
+    # UI Setup
     page.title = "Voice Assistant"
     page.vertical_alignment = ft.MainAxisAlignment.START
 
     chat_list = ft.ListView(expand=True, spacing=10, padding=20, auto_scroll=True)
     webcam_view = ft.Image()
-
-    def on_keyboard_event(e):
-        global stop_streaming, recording
-        if e.meta and e.key == "S":
-            print("Stop Assistant")
-            record_button.icon = ft.icons.MIC
-            record_button.tooltip = "Start Recording"
-            stop_streaming = True
-        
-        elif e.meta and e.key == "R":
-            record_button.icon = ft.icons.MIC if recording else ft.icons.STOP
-            record_button.tooltip = "Start Recording" if recording else "Stop Recording"
-            toggle_recording(e, page, chat_list)
-
-    page.on_keyboard_event = on_keyboard_event
-
-
     input_field = ft.TextField(label="You:",
                                width=90, 
                                expand=True, 
@@ -351,14 +334,48 @@ def main(page):
             ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
         ], expand=True)
     page.add(chat_column)
-    
-    # webcam_column = ft.Column([vision_list], width=640)
-    # main_row = ft.Row([chat_column, webcam_column], expand=True)
-    # page.add(main_row)
+
+
+    # Background Controller Functions
+    def on_keyboard_event(e):
+        global stop_streaming, recording
+        if e.meta and e.key == "S":
+            print("Stop Assistant")
+            record_button.icon = ft.icons.MIC
+            record_button.tooltip = "Start Recording"
+            stop_streaming = True
+        
+        elif e.meta and e.key == "R":
+            record_button.icon = ft.icons.MIC if recording else ft.icons.STOP
+            record_button.tooltip = "Start Recording" if recording else "Stop Recording"
+            toggle_recording(e, page, chat_list)
+
+
+    def detect_wake_work_in_background(chat_list):
+        global wake_event
+        wake_word_detector = WakeWordDetector(wake_event)
+        wake_word_detector.start()
+
+        while True:
+            wake_event.wait()
+            callback(wake_word_detector.clean_prompt, 
+                     chat_list,
+                     transcribe=False)
+
+    # Threadings
+    page.on_keyboard_event = on_keyboard_event
+    detect_thread = threading.Thread(target=detect_wake_work_in_background,
+                                     args=(chat_list, ) )
+    detect_thread.start()
+
     t_vlm = threading.Thread(target=vlm_call)
     t_vlm.start()
    
     threading.Thread(target=webcam_stream, args=(page, webcam_view)).start()
 
+
+
 if __name__ == "__main__":
     ft.app(target=main)
+    # oi = 1
+    
