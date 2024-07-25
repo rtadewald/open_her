@@ -63,6 +63,8 @@ CHUNK = 1024
 
 # Threading Variables
 wake_event = threading.Event()
+voice_detect = threading.Event()
+done_speaking = threading.Event()
 
 last_frames = deque(maxlen=1)
 processed_frames = deque()
@@ -88,7 +90,9 @@ if True:
     template = open('templates/vision_assistant.md', 'r').read()
     prompt = PromptTemplate(input_variables=["input", "video_description"], 
                             template=template)
-    llm = ChatGroq(temperature=0, model_name="llama3-8b-8192")
+    llm = ChatGroq(temperature=0, model_name="llama-3.1-8b-instant")
+    # llm = ChatGroq(temperature=0, model_name="llama3-8b-8192")
+    # llm2 = ChatOpenAI(model_name="gpt-4o-mini")
     memory = ConversationBufferMemory(memory_key="chat_history",
                                     input_key='input')
     llm_chain = LLMChain(llm=llm, prompt=prompt, memory=memory)
@@ -97,7 +101,9 @@ if True:
     template2 = open('templates/vision_prompter.md', 'r').read()
     prompt2 = PromptTemplate(input_variables=["input"], 
                             template=template2)
-    llm2 = ChatGroq(temperature=0, model_name="llama3-8b-8192")
+    llm2 = ChatGroq(temperature=0, model_name="llama-3.1-8b-instant")
+    # llm2 = ChatGroq(temperature=0, model_name="llama3-8b-8192")
+    # llm2 = ChatOpenAI(model_name="gpt-4o-mini")
     memory2 = ConversationBufferMemory(memory_key="chat_history",
                                     input_key='input')
     llm_chain2 = LLMChain(llm=llm2, prompt=prompt2, memory=memory2)
@@ -111,7 +117,8 @@ if True:
         base_url="http://192.168.1.5:23333/v1", 
         api_key="YOUR_API_KEY",
         )
-
+# llm_chain.invoke({"input": "hello", "video_description": ""})
+# llm_chain2.invoke({"input": "hello"})
 
 # Audio Functions
 def toggle_recording(e, page, chat_list):
@@ -168,12 +175,17 @@ def record_audio(filename, chat_list):
                         args=(filename, 
                         chat_list)).start()
 
-def speak(text):
-    global stop_streaming
+def speak(text, voice="onyx"):
+    global stop_streaming, done_speaking
     stop_streaming = False
     player_stream = pyaudio.PyAudio().open(format=pyaudio.paInt16, channels=1, rate=24000, output=True)
     stream_start = False
-    with client.audio.speech.with_streaming_response.create(model="tts-1", voice="onyx", response_format="pcm", input=text) as response:
+    with client.audio.speech.with_streaming_response.create(model="tts-1", 
+                                                            # voice="shimmer", 
+                                                            # voice="echo",
+                                                            voice=voice,
+                                                            response_format="pcm", 
+                                                            input=text) as response:
         silence_threshold = 0.01
         for chunk in response.iter_bytes(chunk_size=1024):
             if stop_streaming:
@@ -186,6 +198,8 @@ def speak(text):
                 if max(chunk) > silence_threshold:
                     player_stream.write(chunk)
                     stream_start = True
+        done_speaking.set()
+        done_speaking.clear()
  
 
 # UI Functions
@@ -230,7 +244,7 @@ def webcam_stream(page, img):
 # MAIN CALLBACK
 def vlm_call():
     global last_frames, recording, process_counter, base_image_prompt 
-    global wake_event
+    global voice_detect
 
     def vision_ai(ts, question, frame):
         global last_frames, process_counter
@@ -244,7 +258,7 @@ def vlm_call():
         process_counter -= 1
 
     while True:
-        wake_event.wait()
+        voice_detect.wait()
         process_counter += 1
 
         # if len(last_frames) > 0:
@@ -352,8 +366,11 @@ def main(page):
 
 
     def detect_wake_work_in_background(chat_list):
-        global wake_event
-        wake_word_detector = WakeWordDetector(wake_event)
+        global wake_event, voice_detect
+        wake_word_detector = WakeWordDetector(wake_event, 
+                                              voice_detect,
+                                              done_speaking,
+                                              min_energy=5)
         wake_word_detector.start()
 
         while True:
@@ -376,6 +393,13 @@ def main(page):
 
 
 if __name__ == "__main__":
-    ft.app(target=main)
-    # oi = 1
+    # ft.app(target=main)
+    speak("ola, tudo bem?", 
+        #   voice="fable",
+        #   voice="echo",
+          voice="onyx",
+        #   voice="nova",
+        #   voice="shimmer",
+          )
+    
     

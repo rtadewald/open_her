@@ -17,17 +17,23 @@ local_client = OpenAI(api_key="cant-be-empty",
 class WakeWordDetector:
     def __init__(self, 
                  wake_event,
-                 wake_word="siri",
-                 min_energy=0.8,
+                 voice_detect,
+                 done_speaking,
+                 wake_word="joão",
+                 min_energy=10,
                  model = "Systran/faster-whisper-small",
                  ):
         
         self.min_energy = min_energy
         self.model = model
         self.wake_word = wake_word
+
+        self.voice_detect = voice_detect
         self.wake_event = wake_event
+        self.done_speaking = done_speaking
 
         self.recognizer = sr.Recognizer()
+        self.recognizer.energy_threshold = 400
         self.microphone = sr.Microphone()
         
     def detect_voice(self, audio_data):
@@ -71,6 +77,8 @@ class WakeWordDetector:
 
                 # try:
                 if voice_detected:
+                    self.voice_detect.set()
+                    self.voice_detect.clear()
                     clean_prompt = local_client.audio.transcriptions.create(
                         model=self.model, 
                         file=audio_data
@@ -80,8 +88,9 @@ class WakeWordDetector:
                 if voice_detected and self.wake_word.lower() in clean_prompt.lower():
                     self.clean_prompt = clean_prompt
                     self.wake_event.set()
+                    self.wake_event.clear()
                     print("Wake word detectada!")
-                self.wake_event.clear()
+                    self.done_speaking.wait()
 
 
     # Função principal para iniciar o listener em uma thread separada
